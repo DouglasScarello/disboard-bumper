@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * Disboard Auto-Bumper v8 (Human-Like Cooldown Delay + Smart Scheduling)
- * Quando o cooldown de 2 horas termina, aguarda um atraso humano aleatório entre 8 e 12 minutos antes do bump.
+ * Disboard Auto-Bumper v9 (Deterministic Timing & Zero-Waste Execution)
+ * Calcula o horário exato matematicamente. Só abre o navegador quando o horário do bump chegar.
  */
 
 const { connect } = require('puppeteer-real-browser');
@@ -39,12 +39,12 @@ const CONFIG = {
   pageTimeout: 60000,
   logsDir: path.join(__dirname, 'logs'),
   screenshotsDir: path.join(__dirname, 'screenshots'),
-  statusFile: path.join(__dirname, 'status.json'),
+  scheduleFile: path.join(__dirname, 'schedule.json'),
   cookiesScript: path.join(__dirname, 'extract-cookies.py'),
 };
 
+const FORCE_CHECK = process.argv.includes('--force') || process.argv.includes('--sync');
 const DRY_RUN = process.argv.includes('--dry-run');
-const NO_WAIT = process.argv.includes('--no-wait'); // Permite pular o atraso de 8-12m em testes manuais se desejar
 
 function log(level, msg) {
   const now = new Date().toISOString();
@@ -87,10 +87,66 @@ function parseCooldownToSeconds(str) {
   return parseInt(match[1], 10) * 3600 + parseInt(match[2], 10) * 60 + parseInt(match[3], 10);
 }
 
+function getRandomDelaySeconds() {
+  const min = CONFIG.extraDelayMinMinutes * 60;
+  const max = CONFIG.extraDelayMaxMinutes * 60;
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function loadSchedule() {
+  if (fs.existsSync(CONFIG.scheduleFile)) {
+    try {
+      return JSON.parse(fs.readFileSync(CONFIG.scheduleFile, 'utf8'));
+    } catch (_) {}
+  }
+  return { servers: {} };
+}
+
+function saveSchedule(schedule) {
+  fs.writeFileSync(CONFIG.scheduleFile, JSON.stringify(schedule, null, 2));
+}
+
 async function doBumps(attempt = 1) {
-  log('INFO', `=== Verificação de Servidores (tentativa ${attempt}/${CONFIG.retryAttempts}) ===`);
-  log('INFO', `Servidores monitorados: ${CONFIG.serverWhitelist.join(', ')}`);
-  log('INFO', `Atraso humano configurado pós-cooldown: ${CONFIG.extraDelayMinMinutes} a ${CONFIG.extraDelayMaxMinutes} minutos.`);
+  const now = Date.now();
+  const schedule = loadSchedule();
+
+  // Verifica se algum servidor agendado já atingiu o horário do bump
+  let needsBrowser = FORCE_CHECK || Object.keys(schedule.servers).length === 0;
+  const serversReady = [];
+
+  for (const [name, data] of Object.entries(schedule.servers)) {
+    if (isAllowed(name)) {
+      if (now >= data.nextBumpTimestamp) {
+        needsBrowser = true;
+        serversReady.push(name);
+      }
+    }
+  }
+
+  // Se nenhum servidor precisa de bump agora, não abre o navegador (0 consumo de CPU/RAM)
+  if (!needsBrowser) {
+    let nextServer = '';
+    let minWait = Infinity;
+    for (const [name, data] of Object.entries(schedule.servers)) {
+      if (isAllowed(name)) {
+        const remaining = data.nextBumpTimestamp - now;
+        if (remaining < minWait) {
+          minWait = remaining;
+          nextServer = name;
+        }
+      }
+    }
+    const mins = Math.max(0, Math.round(minWait / 60000));
+    log('INFO', `⏳ Nenhum servidor pronto agora. Próximo: '${nextServer}' em ${mins} min (${new Date(schedule.servers[nextServer].nextBumpTimestamp).toLocaleTimeString('pt-BR')}).`);
+    return;
+  }
+
+  log('INFO', `=== Executando ciclo de Bump (tentativa ${attempt}/${CONFIG.retryAttempts}) ===`);
+  if (serversReady.length > 0) {
+    log('INFO', `🎯 Servidor(es) no horário agendado: ${serversReady.join(', ')}`);
+  } else {
+    log('INFO', '🔄 Sincronizando horários pela primeira vez...');
+  }
 
   const cookies = getCookies();
   if (!cookies || cookies.length === 0) {
@@ -119,7 +175,7 @@ async function doBumps(attempt = 1) {
     await page.goto(CONFIG.dashboardUrl, { waitUntil: 'networkidle2', timeout: CONFIG.pageTimeout });
 
     if (page.url().includes('/login')) {
-      log('ERROR', 'Sessão expirada. Faça login novamente no navegador.');
+      log('ERROR', 'Sessão expirada.');
       notify('Disboard Bumper ⚠️', 'Sessão expirada no Disboard!');
       await browser.close();
       process.exit(2);
@@ -127,8 +183,8 @@ async function doBumps(attempt = 1) {
 
     await new Promise(r => setTimeout(r, 2000));
 
-    // Analisa servidores
-    const serverStatuses = await page.evaluate(() => {
+    // Analisa servidores na página
+    const detectedServers = await page.evaluate(() => {
       const list = [];
       const cards = document.querySelectorAll('.server, .server-card, .column, [class*="server-item"], article, .card');
 
@@ -153,31 +209,13 @@ async function doBumps(attempt = 1) {
       return list;
     });
 
-    log('INFO', `Status em tempo real:\n${JSON.stringify(serverStatuses, null, 2)}`);
+    log('INFO', `Status detectados no Disboard:\n${JSON.stringify(detectedServers, null, 2)}`);
 
-    let bumpedCount = 0;
-    let minWaitSeconds = 7200;
-
-    for (const s of serverStatuses) {
-      if (!isAllowed(s.name)) {
-        log('INFO', `⏭️ Ignorando '${s.name}' (fora da lista)`);
-        continue;
-      }
+    for (const s of detectedServers) {
+      if (!isAllowed(s.name)) continue;
 
       if (s.available) {
-        // Gera o atraso humano aleatório entre 8 e 12 minutos
-        const minMs = CONFIG.extraDelayMinMinutes * 60 * 1000;
-        const maxMs = CONFIG.extraDelayMaxMinutes * 60 * 1000;
-        const extraDelayMs = NO_WAIT ? 0 : Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-        const extraMinutes = (extraDelayMs / 60000).toFixed(1);
-
-        if (extraDelayMs > 0) {
-          log('INFO', `⏳ Cooldown de 2h finalizado para '${s.name}'!`);
-          log('INFO', `🕒 Aguardando atraso humano aleatório de ${extraMinutes} minutos (entre ${CONFIG.extraDelayMinMinutes} e ${CONFIG.extraDelayMaxMinutes} min) para simular clique natural...`);
-          await new Promise(r => setTimeout(r, extraDelayMs));
-        }
-
-        log('INFO', `🎯 Executando bump oficial em '${s.name}'...`);
+        log('INFO', `🎯 BUMP LIBERADO PARA '${s.name}'! Clicando agora...`);
         const microDelay = Math.floor(Math.random() * (CONFIG.clickDelayMax - CONFIG.clickDelayMin + 1)) + CONFIG.clickDelayMin;
         await new Promise(r => setTimeout(r, microDelay));
 
@@ -199,37 +237,50 @@ async function doBumps(attempt = 1) {
           await new Promise(r => setTimeout(r, 12000));
         }
 
-        bumpedCount++;
         log('INFO', `✅ BUMP OFICIAL CONCLUÍDO: '${s.name}'!`);
         notify('Disboard Bumper ✅', `Bump realizado em: ${s.name}!`);
+
+        // Calcula o próximo horário com precisão: 2h (7200s) + atraso aleatório (8 a 12m)
+        const delaySecs = getRandomDelaySeconds();
+        const nextBumpTime = Date.now() + (7200 + delaySecs) * 1000;
+        schedule.servers[s.name] = {
+          name: s.name,
+          lastBump: new Date().toISOString(),
+          nextBumpTimestamp: nextBumpTime,
+          nextBumpFormatted: new Date(nextBumpTime).toLocaleTimeString('pt-BR'),
+          targetDelayMinutes: +(delaySecs / 60).toFixed(1)
+        };
       } else {
-        const secs = parseCooldownToSeconds(s.cooldown);
-        log('INFO', `⏳ '${s.name}': restam ${s.cooldown || 'calculando'} (~${Math.round(secs / 60)} min de cooldown)`);
-        if (secs > 0 && secs < minWaitSeconds) {
-          minWaitSeconds = secs;
+        // Servidor em cooldown detectado: calcula o próximo bump
+        const remainingCooldownSecs = parseCooldownToSeconds(s.cooldown);
+        const currentScheduled = schedule.servers[s.name];
+
+        // Se ainda não tiver agendamento ou a diferença for grande, calcula
+        if (!currentScheduled || Math.abs((currentScheduled.nextBumpTimestamp - Date.now()) / 1000 - remainingCooldownSecs) > 900) {
+          const delaySecs = getRandomDelaySeconds();
+          const nextBumpTime = Date.now() + (remainingCooldownSecs + delaySecs) * 1000;
+          schedule.servers[s.name] = {
+            name: s.name,
+            lastCheckedCooldown: s.cooldown,
+            nextBumpTimestamp: nextBumpTime,
+            nextBumpFormatted: new Date(nextBumpTime).toLocaleTimeString('pt-BR'),
+            targetDelayMinutes: +(delaySecs / 60).toFixed(1)
+          };
         }
       }
     }
 
-    fs.writeFileSync(CONFIG.statusFile, JSON.stringify({
-      lastCheck: new Date().toISOString(),
-      bumpedCount,
-      servers: serverStatuses,
-      nextCooldownSeconds: minWaitSeconds,
-      extraDelayConfig: `${CONFIG.extraDelayMinMinutes}-${CONFIG.extraDelayMaxMinutes}min`
-    }, null, 2));
+    saveSchedule(schedule);
 
     if (!fs.existsSync(CONFIG.screenshotsDir)) fs.mkdirSync(CONFIG.screenshotsDir, { recursive: true });
     const finalShot = path.join(CONFIG.screenshotsDir, `result-${Date.now()}.png`);
     await page.screenshot({ path: finalShot, fullPage: true });
 
-    log('INFO', `Verificação concluída.`);
+    log('INFO', `Sincronização concluída com sucesso.`);
     await browser.close();
 
-    return { bumpedCount, minWaitSeconds };
-
   } catch (err) {
-    log('ERROR', `Erro: ${err.message}`);
+    log('ERROR', `Erro durante o ciclo: ${err.message}`);
     if (browser) await browser.close().catch(() => {});
     if (attempt < CONFIG.retryAttempts) {
       log('WARN', `Tentando novamente em ${CONFIG.retryDelay / 60000} minutos...`);
@@ -241,6 +292,5 @@ async function doBumps(attempt = 1) {
 
 (async () => {
   [CONFIG.logsDir, CONFIG.screenshotsDir].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
-  log('INFO', 'Iniciando Disboard Auto-Bumper Inteligente com Atraso Humano...');
   await doBumps();
 })();
