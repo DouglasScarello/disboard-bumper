@@ -2,6 +2,8 @@
   "serverWhitelist": [
     "Your Discord Server Name Here"
   ],
+  "extraDelayMinMinutes": 8,
+  "extraDelayMaxMinutes": 12,
   "clickDelayMin": 2000,
   "clickDelayMax": 5000,
   "retryAttempts": 3,

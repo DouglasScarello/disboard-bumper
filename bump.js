@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * Disboard Auto-Bumper
- * Intelligent, fully automated Disboard bumper with Cloudflare Turnstile bypass & Yii2 native form dispatch.
+ * Disboard Auto-Bumper v8 (Human-Like Cooldown Delay + Smart Scheduling)
+ * Quando o cooldown de 2 horas termina, aguarda um atraso humano aleatório entre 8 e 12 minutos antes do bump.
  */
 
 const { connect } = require('puppeteer-real-browser');
@@ -10,26 +10,28 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-// ─── Configuration Loader ────────────────────────────────────────────────────
-let userConfig = { serverWhitelist: [] };
-const configPath = path.join(__dirname, 'config.json');
-const exampleConfigPath = path.join(__dirname, 'config.example.json');
+let userConfig = {
+  serverWhitelist: ["Macaquitos Brasilenõs", "Bryan Productions"],
+  extraDelayMinMinutes: 8,
+  extraDelayMaxMinutes: 12,
+  clickDelayMin: 2000,
+  clickDelayMax: 5000,
+  retryAttempts: 3,
+  retryDelayMinutes: 3
+};
 
+const configPath = path.join(__dirname, 'config.json');
 if (fs.existsSync(configPath)) {
   try {
-    userConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-  } catch (e) {
-    console.error(`[WARN] Failed to parse config.json: ${e.message}`);
-  }
-} else if (fs.existsSync(exampleConfigPath)) {
-  try {
-    userConfig = JSON.parse(fs.readFileSync(exampleConfigPath, 'utf8'));
+    userConfig = Object.assign({}, userConfig, JSON.parse(fs.readFileSync(configPath, 'utf8')));
   } catch (_) {}
 }
 
 const CONFIG = {
-  dashboardUrl: 'https://disboard.org/dashboard/servers',
-  serverWhitelist: userConfig.serverWhitelist || [],
+  dashboardUrl: 'https://disboard.org/pt-br/dashboard/servers',
+  serverWhitelist: userConfig.serverWhitelist || ["Macaquitos Brasilenõs", "Bryan Productions"],
+  extraDelayMinMinutes: userConfig.extraDelayMinMinutes ?? 8,
+  extraDelayMaxMinutes: userConfig.extraDelayMaxMinutes ?? 12,
   clickDelayMin: userConfig.clickDelayMin || 2000,
   clickDelayMax: userConfig.clickDelayMax || 5000,
   retryAttempts: userConfig.retryAttempts || 3,
@@ -42,11 +44,8 @@ const CONFIG = {
 };
 
 const DRY_RUN = process.argv.includes('--dry-run');
-const serverArg = process.argv.find(a => a.startsWith('--server='));
-const SERVER_OVERRIDE = serverArg ? [serverArg.split('=')[1].replace(/"/g, '')] : null;
-const ACTIVE_WHITELIST = SERVER_OVERRIDE || CONFIG.serverWhitelist;
+const NO_WAIT = process.argv.includes('--no-wait'); // Permite pular o atraso de 8-12m em testes manuais se desejar
 
-// ─── Logging & Notifications ────────────────────────────────────────────────
 function log(level, msg) {
   const now = new Date().toISOString();
   const line = `[${now}] [${level}] ${msg}`;
@@ -58,14 +57,14 @@ function log(level, msg) {
 
 function notify(title, body) {
   try {
-    execSync(`notify-send "${title}" "${body}" 2>/dev/null || true`);
+    execSync(`DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus notify-send "${title}" "${body}" 2>/dev/null || true`);
   } catch (_) {}
   log('NOTIFY', `${title}: ${body}`);
 }
 
 function isAllowed(serverName) {
-  if (!ACTIVE_WHITELIST || ACTIVE_WHITELIST.length === 0) return true;
-  return ACTIVE_WHITELIST.some(a =>
+  if (!CONFIG.serverWhitelist || CONFIG.serverWhitelist.length === 0) return true;
+  return CONFIG.serverWhitelist.some(a =>
     serverName.toLowerCase().includes(a.toLowerCase()) ||
     a.toLowerCase().includes(serverName.toLowerCase())
   );
@@ -76,7 +75,7 @@ function getCookies() {
     const out = execSync(`python3 "${CONFIG.cookiesScript}"`, { encoding: 'utf8' });
     return JSON.parse(out);
   } catch (err) {
-    log('ERROR', `Failed to extract session cookies: ${err.message}`);
+    log('ERROR', `Falha ao extrair cookies: ${err.message}`);
     return [];
   }
 }
@@ -88,22 +87,22 @@ function parseCooldownToSeconds(str) {
   return parseInt(match[1], 10) * 3600 + parseInt(match[2], 10) * 60 + parseInt(match[3], 10);
 }
 
-// ─── Main Bump Routine ───────────────────────────────────────────────────────
 async function doBumps(attempt = 1) {
-  log('INFO', `=== Starting Bump Cycle (attempt ${attempt}/${CONFIG.retryAttempts}) ===`);
-  log('INFO', `Monitored Servers: ${ACTIVE_WHITELIST.length > 0 ? ACTIVE_WHITELIST.join(', ') : 'ALL (No Whitelist)'}`);
+  log('INFO', `=== Verificação de Servidores (tentativa ${attempt}/${CONFIG.retryAttempts}) ===`);
+  log('INFO', `Servidores monitorados: ${CONFIG.serverWhitelist.join(', ')}`);
+  log('INFO', `Atraso humano configurado pós-cooldown: ${CONFIG.extraDelayMinMinutes} a ${CONFIG.extraDelayMaxMinutes} minutos.`);
 
   const cookies = getCookies();
   if (!cookies || cookies.length === 0) {
-    log('ERROR', 'No Disboard session cookies found. Please log in to Disboard in your browser first.');
-    notify('Disboard Bumper ❌', 'Please log in to Disboard in your browser!');
+    log('ERROR', 'Cookies não encontrados.');
+    notify('Disboard Bumper ❌', 'Faça login no Disboard pelo navegador!');
     process.exit(1);
   }
 
   let browser;
   let page;
   try {
-    log('INFO', 'Launching Real Browser with Cloudflare Turnstile handler...');
+    log('INFO', 'Iniciando navegador com proteção Cloudflare...');
     const conn = await connect({
       headless: false,
       turnstile: true,
@@ -117,19 +116,18 @@ async function doBumps(attempt = 1) {
       try { await page.setCookie(c); } catch (_) {}
     }
 
-    log('INFO', `Navigating to ${CONFIG.dashboardUrl}...`);
     await page.goto(CONFIG.dashboardUrl, { waitUntil: 'networkidle2', timeout: CONFIG.pageTimeout });
 
     if (page.url().includes('/login')) {
-      log('ERROR', 'Session expired. Please log in to Disboard again in your browser.');
-      notify('Disboard Bumper ⚠️', 'Disboard session expired!');
+      log('ERROR', 'Sessão expirada. Faça login novamente no navegador.');
+      notify('Disboard Bumper ⚠️', 'Sessão expirada no Disboard!');
       await browser.close();
       process.exit(2);
     }
 
     await new Promise(r => setTimeout(r, 2000));
 
-    // Extract real-time status of all servers on dashboard
+    // Analisa servidores
     const serverStatuses = await page.evaluate(() => {
       const list = [];
       const cards = document.querySelectorAll('.server, .server-card, .column, [class*="server-item"], article, .card');
@@ -139,7 +137,6 @@ async function doBumps(attempt = 1) {
         if (!heading) return;
         const name = heading.textContent.trim();
 
-        // Check for countdown timer (e.g. 01:45:20)
         const allText = card.innerText;
         const match = allText.match(/(\d{1,2}:\d{2}:\d{2})/);
         const cooldownText = match ? match[1] : null;
@@ -156,24 +153,35 @@ async function doBumps(attempt = 1) {
       return list;
     });
 
-    log('INFO', `Detected Servers Status:\n${JSON.stringify(serverStatuses, null, 2)}`);
+    log('INFO', `Status em tempo real:\n${JSON.stringify(serverStatuses, null, 2)}`);
 
     let bumpedCount = 0;
     let minWaitSeconds = 7200;
 
     for (const s of serverStatuses) {
       if (!isAllowed(s.name)) {
-        log('INFO', `⏭️ Skipping '${s.name}' (not in whitelist)`);
+        log('INFO', `⏭️ Ignorando '${s.name}' (fora da lista)`);
         continue;
       }
 
       if (s.available) {
-        log('INFO', `🎯 BUMP READY FOR '${s.name}'! Triggering...`);
-        const delay = Math.floor(Math.random() * (CONFIG.clickDelayMax - CONFIG.clickDelayMin + 1)) + CONFIG.clickDelayMin;
-        await new Promise(r => setTimeout(r, delay));
+        // Gera o atraso humano aleatório entre 8 e 12 minutos
+        const minMs = CONFIG.extraDelayMinMinutes * 60 * 1000;
+        const maxMs = CONFIG.extraDelayMaxMinutes * 60 * 1000;
+        const extraDelayMs = NO_WAIT ? 0 : Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+        const extraMinutes = (extraDelayMs / 60000).toFixed(1);
+
+        if (extraDelayMs > 0) {
+          log('INFO', `⏳ Cooldown de 2h finalizado para '${s.name}'!`);
+          log('INFO', `🕒 Aguardando atraso humano aleatório de ${extraMinutes} minutos (entre ${CONFIG.extraDelayMinMinutes} e ${CONFIG.extraDelayMaxMinutes} min) para simular clique natural...`);
+          await new Promise(r => setTimeout(r, extraDelayMs));
+        }
+
+        log('INFO', `🎯 Executando bump oficial em '${s.name}'...`);
+        const microDelay = Math.floor(Math.random() * (CONFIG.clickDelayMax - CONFIG.clickDelayMin + 1)) + CONFIG.clickDelayMin;
+        await new Promise(r => setTimeout(r, microDelay));
 
         if (!DRY_RUN) {
-          // Native Yii2 jQuery dispatch for complete CSRF POST integration
           await page.evaluate((sName) => {
             document.querySelectorAll('a.button-bump').forEach(el => {
               const card = el.closest('.server, .server-card, .column, [class*="server-item"], article, .card') || el.parentElement;
@@ -187,44 +195,44 @@ async function doBumps(attempt = 1) {
             });
           }, s.name);
 
-          log('INFO', 'Waiting for Turnstile & Disboard confirmation...');
+          log('INFO', `Aguardando processamento e confirmação...`);
           await new Promise(r => setTimeout(r, 12000));
         }
 
         bumpedCount++;
-        log('INFO', `✅ BUMP COMPLETED FOR '${s.name}'!`);
-        notify('Disboard Bumper ✅', `Bump executed for: ${s.name}!`);
+        log('INFO', `✅ BUMP OFICIAL CONCLUÍDO: '${s.name}'!`);
+        notify('Disboard Bumper ✅', `Bump realizado em: ${s.name}!`);
       } else {
         const secs = parseCooldownToSeconds(s.cooldown);
-        log('INFO', `⏳ '${s.name}': remaining cooldown ${s.cooldown || 'calculating'} (~${Math.round(secs / 60)} min)`);
+        log('INFO', `⏳ '${s.name}': restam ${s.cooldown || 'calculando'} (~${Math.round(secs / 60)} min de cooldown)`);
         if (secs > 0 && secs < minWaitSeconds) {
           minWaitSeconds = secs;
         }
       }
     }
 
-    // Save status to local JSON
     fs.writeFileSync(CONFIG.statusFile, JSON.stringify({
       lastCheck: new Date().toISOString(),
       bumpedCount,
       servers: serverStatuses,
-      nextCooldownSeconds: minWaitSeconds
+      nextCooldownSeconds: minWaitSeconds,
+      extraDelayConfig: `${CONFIG.extraDelayMinMinutes}-${CONFIG.extraDelayMaxMinutes}min`
     }, null, 2));
 
     if (!fs.existsSync(CONFIG.screenshotsDir)) fs.mkdirSync(CONFIG.screenshotsDir, { recursive: true });
     const finalShot = path.join(CONFIG.screenshotsDir, `result-${Date.now()}.png`);
     await page.screenshot({ path: finalShot, fullPage: true });
 
-    log('INFO', `Cycle completed. Next suggested check in approx ${Math.round(minWaitSeconds / 60)} minutes.`);
+    log('INFO', `Verificação concluída.`);
     await browser.close();
 
     return { bumpedCount, minWaitSeconds };
 
   } catch (err) {
-    log('ERROR', `Error during bump cycle: ${err.message}`);
+    log('ERROR', `Erro: ${err.message}`);
     if (browser) await browser.close().catch(() => {});
     if (attempt < CONFIG.retryAttempts) {
-      log('WARN', `Retrying in ${CONFIG.retryDelay / 60000} minutes...`);
+      log('WARN', `Tentando novamente em ${CONFIG.retryDelay / 60000} minutos...`);
       await new Promise(r => setTimeout(r, CONFIG.retryDelay));
       return doBumps(attempt + 1);
     }
@@ -233,6 +241,6 @@ async function doBumps(attempt = 1) {
 
 (async () => {
   [CONFIG.logsDir, CONFIG.screenshotsDir].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
-  log('INFO', 'Disboard Auto-Bumper started...');
+  log('INFO', 'Iniciando Disboard Auto-Bumper Inteligente com Atraso Humano...');
   await doBumps();
 })();
