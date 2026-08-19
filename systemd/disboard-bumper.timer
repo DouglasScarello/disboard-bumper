@@ -1,0 +1,12 @@
+[Unit]
+Description=Disboard Auto-Bumper Periodic Timer
+Requires=disboard-bumper.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=20min
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

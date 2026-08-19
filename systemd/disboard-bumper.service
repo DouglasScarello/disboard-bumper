@@ -1,0 +1,16 @@
+[Unit]
+Description=Disboard Auto-Bumper Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/node /path/to/disboard-bumper/bump.js
+WorkingDirectory=/path/to/disboard-bumper
+Environment=DISPLAY=:0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

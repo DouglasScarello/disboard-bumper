@@ -1,0 +1,9 @@
+{
+  "serverWhitelist": [
+    "Your Discord Server Name Here"
+  ],
+  "clickDelayMin": 2000,
+  "clickDelayMax": 5000,
+  "retryAttempts": 3,
+  "retryDelayMinutes": 3
+}
